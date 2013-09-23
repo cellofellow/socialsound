@@ -1,3 +1,4 @@
 Twisted>=13.1.0
 -e git+https://github.com/b52/python-mpd-twisted.git@339bcda400470a176ae74aba87e4e6509250df18#egg=python-mpd-twisted
 autobahn>=0.5.14
+pyOpenSSL>=0.13.1
