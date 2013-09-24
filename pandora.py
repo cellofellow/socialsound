@@ -1,27 +1,7 @@
-import json
-import sys
 import time
-import urllib
-from cStringIO import StringIO
 
-from twisted.internet import defer, task, reactor
-from twisted.internet.ssl import ClientContextFactory
-from twisted.python import failure, log
-from twisted.web.client import Agent, readBody, FileBodyProducer
-from twisted.web.client import ProxyAgent
-from twisted.web.http_headers import Headers
-from twisted.internet.endpoints import TCP4ClientEndpoint
-
-from autobahn.websocket import (WebSocketServerFactory,
-                                WebSocketServerProtocol,
-                                listenWS)
-
-from blowfish import Blowfish
-
-
-class WebClientContextFactory(ClientContextFactory):
-    def getContext(self, hostname, port):
-        return ClientContextFactory.getContext(self)
+from twisted.internet.defer import inlineCallbacks, returnValue
+from twisted.python import log
 
 
 class PandoraError(IOError):
@@ -68,7 +48,7 @@ def pad_null(s, l):
     return s + "\0" * (l - len(s))
 
 
-class PandoraJson:
+class PandoraMixin:
     """
     Mixin for basic Pandora code.
     """
@@ -82,6 +62,18 @@ class PandoraJson:
         DECRYPT_KEY = 'R=U!LH$O2B#'
         VERSION = '5'
 
+    AUDIO_FORMATS = {
+        'highQuality': 'High',
+        'mediumQuality': 'Medium',
+        'lowQuality': 'Low',
+    }
+
+    RATE_BAN = 'ban'
+    RATE_LOVE = 'love'
+    RATE_NONE = None
+
+    PLAYLIST_VALIDITY_TIME = 60*60*3
+
     def pandora_encrypt(self, s):
         return "".join(
             [self.blowfish_encode.encrypt(pad_null(s[i:i+8], 8)).encode('hex')
@@ -92,162 +84,179 @@ class PandoraJson:
             [self.blowfish_decode.decrypt(pad_null(s[i:i+16].decode('hex'), 8))
              for i in xrange(0, len(s), 16)]).rstrip('\x08')
 
-
-class PandoraJsonProtocol(WebSocketServerProtocol, PandoraJson):
-    """
-    Connect to the Pandora JSON API and provide a websocket interface to it.
-    """
+    audio_quality = AUDIO_FORMATS['highQuality']
 
 
-class PandoraJsonFactory(WebSocketServerFactory, PandoraJson):
-    """
-    Connect to the Pandora JSON API and provide a websocket interface to it.
-    """
+class Station(object, PandoraMixin):
+    def __init__(self, factory, **kwargs):
+        self.factory = factory
 
-    def __init__(self, *args, **kwargs):
-        self.username = kwargs.pop('username')
-        self.password = kwargs.pop('password')
-        self.proxy_host = kwargs.pop('proxy_host', None)
-        self.proxy_port = kwargs.pop('proxy_port', 8080)
-        WebSocketServerFactory.__init__(self, *args, **kwargs)
-        self.connect()
+        self.id = kwargs['stationId']
+        self.id_token = kwargs['stationToken']
+        self.is_creator = not kwargs['isShared']
+        self.is_quick_mix = kwargs['isQuickMix']
+        self.name = kwargs['stationName']
+        self.use_quick_mix = False
 
-    @defer.inlineCallbacks
-    def json_call(self, method, **kwargs):
-        https = kwargs.pop('https', False)
-        blowfish = kwargs.pop('blowfish', True)
+        if self.is_quick_mix:
+            self.factory.quick_mix_station_ids = kwargs.get(
+                'quickMixStationIds', [])
 
-        url_args = {'method': method}
-        if self.partner_id:
-            url_args['partner_id'] = self.partner_id
-        if self.user_id:
-            url_args['user_id'] = self.user_id
-        if self.user_auth_token or self.partner_auth_token:
-            url_args['auth_token'] = (self.user_auth_token or
-                                      self.partner_auth_token)
+    def __repr__(self):
+        return u'<Station: {}>'.format(unicode(self))
 
-        protocol = 'https' if https else 'http'
-        url = protocol + self.rpc_url + urllib.urlencode(url_args)
+    def __unicode__(self):
+        return self.name
 
-        if self.time_offset:
-            kwargs['syncTime'] = int(time.time() + self.time_offset)
-        if self.user_auth_token:
-            kwargs['userAuthToken'] = self.user_auth_token
-        elif self.partner_auth_token:
-            kwargs['partnerAuthToken'] = self.partner_auth_token
+    @inlineCallbacks
+    def transform_if_shared(self):
+        if not self.is_creator:
+            log.msg("pandora: transforming station")
+            yield self.factory.json_call('station.transformSharedStation',
+                                         stationToken=self.id_token)
+            self.is_creator = True
 
-        data = json.dumps(kwargs)
+    @inlineCallbacks
+    def get_playlist(self):
+        log.msg("pandora: Get Playlist")
+        playlist = yield self.factory.json_call('station.getPlaylist',
+                                                https=True,
+                                                stationToken=self.id_token)
+        songs = []
+        for i in playlist['items']:
+            if 'songName' in i:  # check for ads
+                songs.append(Song(self.factory, **i))
 
-        if blowfish:
-            data = self.pandora_encrypt(data)
+        returnValue(songs)
 
-        if self.proxy_host:
-            endpoint = TCP4ClientEndpoint(reactor, self.proxy_host,
-                                          self.proxy_port)
-            agent = ProxyAgent(endpoint, WebClientContextFactory())
-        else:
-            agent = Agent(reactor, WebClientContextFactory())
+    @property
+    def info_url(self):
+        return 'http://www.pandora.com/stations/'+self.id_token
 
-        headers = Headers({'User-Agent': ['pithos'],
-                           'Content-type': ['text/plain']})
-        body = FileBodyProducer(StringIO(data))
+    @inlineCallbacks
+    def rename(self, new_name):
+        if new_name != self.name:
+            yield self.transform_if_shared()
+            log.msg("pandora: Renaming station")
+            yield self.factory.json_call('station.renameStation',
+                                         stationName=new_name,
+                                         stationToken=self.id_token)
+            self.name = new_name
 
+    @inlineCallbacks
+    def delete(self):
+        log.msg("pandora: Deleting Station")
+        yield self.factory.json_call('station.deleteStation',
+                                     stationToken=self.id_token)
+
+
+class Song(object, PandoraMixin):
+    def __init__(self, factory, **kwargs):
+        self.factory = factory
+
+        self.album = kwargs['albumName']
+        self.artist = kwargs['artistName']
+        self.audio_url_map = kwargs['audioUrlMap']
+        self.track_token = kwargs['trackToken']
+        # Banned songs won't play, so we don't care about them.
+        self.rating = (self.RATE_LOVE if kwargs['songRating'] == 1
+                       else self.RATE_NONE)
+        self.station_id = kwargs['stationId']
+        self.title = kwargs['songName']
+        self.song_detail_url = kwargs['songDetailUrl']
+        self.art_radio = kwargs['albumArtUrl']
+
+        self.tired = False
+        self.message = ''
+        self.start_time = None
+        self.finished = False
+        self.playlist_time = time.time()
+        self.feedback_id = None
+
+    def __repr__(self):
+        return u'<Song: {}>'.format(unicode(self))
+
+    def __unicode__(self):
+        return u'{} by {} from {}'.format(self.title, self.artist, self.album)
+
+    @property
+    def audio_url(self):
+        quality = self.factory.audio_quality
         try:
-            response = yield agent.request('POST', url, headers, body)
-            body = yield readBody(response)
-            tree = json.loads(body)
-            if tree['stat'] == 'fail':
-                code = tree['code']
-                msg = tree['message']
-                log.msg('fault code: {} message: {}'.format(code, msg))
+            q = self.audio_url_map[quality]
+            log.msg("Using audio quality {}: {} {}".format(quality,
+                                                           q['bitrate'],
+                                                           q['encoding']))
+            return q['audioUrl']
 
-                if code == API_ERROR.INVALID_AUTH_TOKEN:
-                    raise PandoraAuthTokenInvalid(msg)
-                elif code == API_ERROR.COUNTRY_NOT_SUPPORTED:
-                    raise PandoraError(
-                        "Pandora not available", code,
-                        "Pandora is not available outside the US.")
-                elif code == API_ERROR.API_VERSION_NOT_SUPPORTED:
-                    raise PandoraAPIVersionError(msg)
-                elif code == API_ERROR.INSUFFICIENT_CONNECTIVITY:
-                    raise PandoraError(
-                        "Out of sync", code, "Correct your system's clock.")
-                elif code == API_ERROR.READ_ONLY_MODE:
-                    raise PandoraError(
-                        "Pandora maintenance", code,
-                        "Pandora is in read-only mode as it is performing "
-                        "maintenance. Try again later.")
-                elif code == API_ERROR.INVALID_LOGIN:
-                    raise PandoraError(
-                        "Login Error", code, "Invalid username or password.")
-                elif code == API_ERROR.LISTENER_NOT_AUTHORIZED:
-                    raise PandoraError(
-                        "Pandora One Error", code,
-                        "A Pandora One account is required to access this "
-                        "feature.")
-                elif code == API_ERROR.PARTNER_NOT_AUTHORIZED:
-                    raise PandoraError(
-                        "Login Error", code, "Invalid Pandora partner keys.")
-                else:
-                    raise PandoraError(msg, code)
+        except KeyError:
+            log.err("Unable to use audio format {}. Using {}".format(
+                quality, self.audio_url_map.keys()[0]))
+            return self.audio_url_map.values()[0]['audioUrl']
 
-            if 'result' in tree:
-                defer.returnValue(tree['result'])
+    @property
+    def station(self):
+        return self.factory.get_station_by_id(self.station_id)
 
-        except Exception:
-            failure.Failure().printTraceback()
-            reactor.stop()
+    @inlineCallbacks
+    def rate(self, rating):
+        if self.rating != rating:
+            self.station.transform_if_shared()
+            if rating == self.RATE_NONE:
+                if not self.feedback_id:
+                    # We need a feedback_id, get one by re-rating the song. We
+                    # could also get one by calling station.get_station, but
+                    # that requires transferring a lot of data (all feedback,
+                    # seeds, etc for the station).
+                    opposite = (self.RATE_BAN if self.rating == self.RATE_LOVE
+                                else self.RATE_LOVE)
+                    self.feedback_id = yield self.factory.add_feedback(
+                        self.track_token, opposite)
+                yield self.factory.delete_feedback(self.station.id_token,
+                                                   self.feedback_id)
+            else:
+                self.feedback_id = yield self.factory.add_feedback(
+                    self.track_token, rating)
+            self.rating = rating
 
-    @defer.inlineCallbacks
-    def connect(self):
-        self.partner_id = self.user_id = self.partner_auth_token = None
-        self.user_auth_token = self.time_offset = None
-        self.rpc_url = self.KEY.RPC_URL
-        self.blowfish_encode = Blowfish(self.KEY.ENCRYPT_KEY)
-        self.blowfish_decode = Blowfish(self.KEY.DECRYPT_KEY)
+    @inlineCallbacks
+    def set_tired(self):
+        if not self.tired:
+            yield self.factory.json_call('user.sleepSong',
+                                         track_token=self.track_token)
+            self.tired = True
 
-        partner = yield self.json_call('auth.partnerLogin',
-                                       https=True,
-                                       blowfish=False,
-                                       deviceModel=self.KEY.DEVICEMODEL,
-                                       username=self.KEY.USERNAME,
-                                       password=self.KEY.PASSWORD,
-                                       version=self.KEY.VERSION)
+    @inlineCallbacks
+    def bookmark(self):
+        yield self.factory.json_call('bookmark.addSongBookmark',
+                                     track_token=self.track_token)
 
-        self.partner_id = partner['partnerId']
-        self.partner_auth_token = partner['partnerAuthToken']
-        pandora_time = int(self.pandora_decrypt(partner['syncTime'])[4:14])
-        self.time_offset = pandora_time - time.time()
-        log.msg("The time offset is {}".format(self.time_offset))
+    @inlineCallbacks
+    def bookmark_artist(self):
+        yield self.factory.json_call('bookmark.addArtistBookmark',
+                                     track_token=self.track_token)
 
-        user = yield self.json_call('auth.userLogin',
-                                    https=True,
-                                    username=self.username,
-                                    password=self.password,
-                                    loginType='user')
+    @property
+    def rating_str(self):
+        return self.rating
 
-        self.user_id = user['userId']
-        self.user_auth_token = user['userAuthToken']
-        defer.returnValue(True)
+    def is_still_valid(self):
+        return (time.time() - self.playlist_time) < self.PLAYLIST_VALIDITY_TIME
 
 
-def main():
-    log.startLogging(sys.stderr)
+class SearchResult(object):
+    def __init__(self, result_type, **kwargs):
+        self.result_type = result_type
+        self.score = kwargs['score']
+        self.musicId = kwargs['musicToken']
 
-    if len(sys.argv) == 4:
-        proxy = {"proxy_host": sys.argv[3]}
-    elif len(sys.argv) == 5:
-        proxy = {"proxy_host": sys.argv[3], "proxy_port": sys.argv[4]}
-    else:
-        proxy = {}
+        if result_type == 'song':
+            self.title = kwargs['songName']
+            self.artist = kwargs['artistName']
+        elif result_type == 'artist':
+            self.name = kwargs['artistName']
 
-    factory = PandoraJsonFactory("ws://localhost:9000", debug=False,
-                                 username=sys.argv[1], password=sys.argv[2],
-                                 **proxy)
-    factory.protocol = PandoraJsonProtocol
-    listenWS(factory)
 
-    reactor.run()
-
-if __name__ == '__main__':
-    main()
+__all__ = ['Station', 'Song', 'SearchResult', 'PandoraMixin', 'API_ERROR',
+           'PandoraError', 'PandoraAuthTokenInvalid', 'PandoraNetError',
+           'PandoraAPIVersionError', 'PandoraTimeout']
