@@ -1,10 +1,16 @@
 import json
+import os
 import sys
 import time
 import urllib
 from cStringIO import StringIO
+from itertools import izip as zip
 
-from twisted.internet import defer, reactor
+from configobj import ConfigObj
+import xdg.BaseDirectory
+
+from twisted.internet import reactor, task
+from twisted.internet.defer import inlineCallbacks, returnValue
 from twisted.internet.ssl import ClientContextFactory
 from twisted.python import failure, log
 from twisted.web.client import Agent, readBody, FileBodyProducer
@@ -15,11 +21,16 @@ from twisted.internet.endpoints import TCP4ClientEndpoint
 from autobahn.websocket import (WebSocketServerFactory,
                                 WebSocketServerProtocol,
                                 listenWS)
+from mpd import MPDFactory, MPD_HOST, MPD_PORT
 
 from blowfish import Blowfish
 from pandora import (PandoraMixin, Station, SearchResult, API_ERROR,
                      PandoraError, PandoraAuthTokenInvalid,
                      PandoraAPIVersionError)
+
+
+class SocialSoundError(Exception):
+    pass
 
 
 class WebClientContextFactory(ClientContextFactory):
@@ -32,76 +43,13 @@ class PandoraProtocol(WebSocketServerProtocol, PandoraMixin):
     Connect to the Pandora JSON API and provide a websocket interface to it.
     """
 
-    def bad_command(self, arg):
-        self.sendMessage("Bad command.")
+    def onOpen(self):
+        self.factory.register(self)
+        self.sendMessage("SocialSound WebSocket")
 
-    @defer.inlineCallbacks
-    def cmd_login(self, arg):
-        if all((hasattr(self.factory, 'user_id'),
-                hasattr(self.factory, 'user_auth_token'))):
-            self.sendMessage("Already logged in.")
-        else:
-            username, password = arg.split(' ', 1)
-            try:
-                yield self.factory.login(username, password)
-                self.sendMessage("Success")
-            except PandoraError as e:
-                self.sendMessage("Error: " + e.message)
-            except Exception as e:
-                self.sendMessage("There was a server error.")
-                failure.Failure().printTraceback()
-
-    @defer.inlineCallbacks
-    def cmd_stations(self, arg):
-        try:
-            stations = yield self.factory.get_stations()
-            station_data = [{'name': s.name, 'id': s.id} for s in stations]
-            self.sendMessage(json.dumps(station_data, indent=4))
-        except PandoraError as e:
-            self.sendMessage("Error: " + e.message)
-        except Exception as e:
-            self.sendMessage("There was a server error.")
-            failure.Failure().printTraceback()
-
-    @defer.inlineCallbacks
-    def cmd_get_playlist(self, arg):
-        try:
-            station = None
-            if not arg and hasattr(self.factory, 'current_station'):
-                station = self.factory.current_station
-            else:
-                station = self.factory.get_station_by_id(arg)
-
-            if station:
-                playlist = yield station.get_playlist()
-                self.factory.current_station = station
-                self.factory.current_playlist = playlist
-                self.cmd_playlist(None)
-            else:
-                self.sendMessage("Station {} not found.".format(arg))
-
-        except PandoraError as e:
-            self.sendMessage("Error: " + e.message)
-        except Exception as e:
-            self.sendMessage("There was a server error.")
-            failure.Failure().printTraceback()
-
-    cmd_set_station = cmd_get_playlist
-
-    def cmd_playlist(self, arg):
-        try:
-            playlist = getattr(self.factory, 'current_playlist', None)
-            if playlist:
-                song_names = [unicode(s) for s in playlist]
-                self.sendMessage(json.dumps(song_names, indent=4))
-            else:
-                self.sendMessage("No playlist set.")
-
-        except PandoraError as e:
-            self.sendMessage("Error: " + e.message)
-        except Exception as e:
-            self.sendMessage("There was a server error.")
-            failure.Failure().printTraceback()
+    def connectionLost(self, reason):
+        self.factory.unregister(self)
+        WebSocketServerProtocol.connectionLost(self, reason)
 
     def onMessage(self, msg, binary):
         split = msg.split(' ', 1)
@@ -113,6 +61,26 @@ class PandoraProtocol(WebSocketServerProtocol, PandoraMixin):
         method = getattr(self, 'cmd_' + command, self.bad_command)
         method(arg)
 
+    def bad_command(self, arg):
+        self.sendMessage("Bad command.")
+
+
+    def cmd_stations(self, _):
+        stations = self.factory.stations
+        resp = [{'name': s.name, 'id': s.id} for s in stations]
+        message = json.dumps(resp, indent=4)
+        self.sendMessage(message)
+
+    @inlineCallbacks
+    def cmd_play_station(self, station_id):
+        try:
+            yield self.factory.play_station(station_id)
+        except (PandoraError, SocialSoundError) as e:
+            self.sendMessage("Error: " + e.message)
+        except Exception:
+            self.sendMessage("There was a server error.")
+            failure.Failure().printTraceback()
+
 
 class PandoraFactory(WebSocketServerFactory, PandoraMixin):
     """
@@ -120,11 +88,31 @@ class PandoraFactory(WebSocketServerFactory, PandoraMixin):
     """
 
     def __init__(self, *args, **kwargs):
+        self.username = kwargs.pop('username')
+        self.password = kwargs.pop('password')
         self.proxy_host = kwargs.pop('proxy_host', None)
         self.proxy_port = kwargs.pop('proxy_port', 8080)
+        self.clients = set()
         WebSocketServerFactory.__init__(self, *args, **kwargs)
+        self.initialize()
 
-    @defer.inlineCallbacks
+    @inlineCallbacks
+    def initialize(self):
+        try:
+            yield self.connect()
+            yield self.login()
+            yield self.get_stations()
+        except:
+            failure.Failure().printTraceback()
+            reactor.stop()
+
+    def register(self, client):
+        self.clients.add(client)
+
+    def unregister(self, client):
+        self.clients.remove(client)
+
+    @inlineCallbacks
     def json_call(self, method, **kwargs):
         https = kwargs.pop('https', False)
         blowfish = kwargs.pop('blowfish', True)
@@ -203,9 +191,9 @@ class PandoraFactory(WebSocketServerFactory, PandoraMixin):
                 raise PandoraError(msg, code)
 
         if 'result' in tree:
-            defer.returnValue(tree['result'])
+            returnValue(tree['result'])
 
-    @defer.inlineCallbacks
+    @inlineCallbacks
     def connect(self):
         self.partner_id = self.user_id = self.partner_auth_token = None
         self.user_auth_token = self.time_offset = None
@@ -227,20 +215,20 @@ class PandoraFactory(WebSocketServerFactory, PandoraMixin):
         self.time_offset = pandora_time - time.time()
         log.msg("The time offset is {}".format(self.time_offset))
 
-    @defer.inlineCallbacks
-    def login(self, username, password):
+    @inlineCallbacks
+    def login(self):
         if not all((hasattr(self, 'partner_id'),
                     hasattr(self, 'partner_auth_token'))):
             yield self.connect()
 
         user = yield self.json_call(
-            'auth.userLogin', https=True, username=username, password=password,
-            loginType='user')
+            'auth.userLogin', https=True, username=self.username,
+            password=self.password, loginType='user')
 
         self.user_id = user['userId']
         self.user_auth_token = user['userAuthToken']
 
-    @defer.inlineCallbacks
+    @inlineCallbacks
     def get_stations(self):
         response = yield self.json_call('user.getStationList')
         stations = response['stations']
@@ -251,42 +239,39 @@ class PandoraFactory(WebSocketServerFactory, PandoraMixin):
                 if s.id in self.quick_mix_station_ids:
                     s.use_quick_mix = True
 
-        defer.returnValue(self.stations)
+        returnValue(self.stations)
 
-    @defer.inlineCallbacks
+    @inlineCallbacks
     def save_quick_mix(self):
-        station_ids = []
-        for s in self.stations:
-            if s.use_quick_mix:
-                station_ids.append(s.id)
+        station_ids = [s.id for s in self.stations if s.use_quick_mix]
 
         yield self.json_call('user.setQuickMix',
                              quickMixStationIds=station_ids)
 
-    @defer.inlineCallbacks
+    @inlineCallbacks
     def search(self, query):
         response = yield self.json_call('music.search', searchText=query)
         results = [SearchResult('artist', **a) for a in response['artists']]
         results += [SearchResult('song', **s) for s in response['songs']]
         results.sort(key=lambda i: i.score, reverse=True)
 
-        defer.returnValue(results)
+        returnValue(results)
 
-    @defer.inlineCallbacks
+    @inlineCallbacks
     def add_station_by_music_id(self, music_id):
         response = yield self.json_call('station.createStation',
                                         musicToken=music_id)
         station = Station(self, **response)
         self.stations.append(station)
 
-        defer.returnValue(station)
+        returnValue(station)
 
     def get_station_by_id(self, id):
         for s in self.stations:
             if s.id == id:
                 return s
 
-    @defer.inlineCallbacks
+    @inlineCallbacks
     def add_feedback(self, track_token, rating):
         log.msg("pandora: addFeedback")
         rating = True if rating == self.RATE_LOVE else False
@@ -294,27 +279,113 @@ class PandoraFactory(WebSocketServerFactory, PandoraMixin):
                                         trackToken=track_token,
                                         isPositive=rating)
 
-        defer.returnValue(feedback['feedbackId'])
+        returnValue(feedback['feedbackId'])
 
-    @defer.inlineCallbacks
+    @inlineCallbacks
     def delete_feedback(self, station_token, feedback_id):
         yield self.json_call('station.deleteFeedback', feedbackId=feedback_id,
                              stationToken=station_token)
+
+    @inlineCallbacks
+    def get_playlist(self):
+        station = getattr(self, 'station', None)
+        if not station:
+            raise SocialSoundError("No station set.")
+        playlist = yield station.get_playlist()
+        self.playlist = playlist
+        returnValue(playlist)
+
+    @inlineCallbacks
+    def play_station(self, station_id):
+        log.msg(station_id)
+        player = self.player.p
+        station = self.get_station_by_id(station_id)
+        if not station:
+            raise SocialSoundError(
+                "Station {} not found".format(station_id))
+        self.station = station
+        while self.station == station:
+            yield self.get_playlist()
+            player.command_list_ok_begin()
+            for song in self.playlist:
+                player.addid(song.audio_url)
+            result_list = yield player.command_list_end()
+            for mpd_id, song in zip(result_list, self.playlist):
+                song.mpd_id = mpd_id
+            yield player.playid(self.playlist[0].mpd_id)
+            self.status_loop()
+
+    @inlineCallbacks
+    def status_loop(self):
+        player = self.player.p
+        previous_song = None
+        current_song = None
+        status = yield player.status()
+        current_song_id = status.get('song_id', None)
+        if current_song_id is None:
+            returnValue(None)
+        current_song = [s for s in self.playlist
+                        if s.mpd_id == current_song_id][0]
+
+        while [s for s in self.playlist if not hasattr(s, 'played')]:
+            try:
+                log.msg("Previous Song: {}".format(unicode(previous_song)))
+                log.msg("Current Song: {}".format(unicode(current_song)))
+                status = yield player.status()
+
+                current_song_id = status.get('song_id', None)
+                if current_song_id is None:
+                    returnValue(None)
+
+                previous_song = current_song
+                current_song = [s for s in self.playlist
+                                if s.mpd_id == current_song_id][0]
+
+                if previous_song != current_song:
+                    prevous_song.played = True
+
+                status['current_song'] = unicode(current_song)
+                message = json.dumps(status, indent=4)
+                for c in self.clients:
+                    c.sendMessage(message)
+                yield task.deferLater(reactor, 1, lambda: None)
+
+            except Exception:
+                failure.Failure().printTraceback()
+
+
+class PlayerFactory(MPDFactory):
+    def connectionMade(self, protocol):
+        self.p = protocol
 
 
 def main():
     log.startLogging(sys.stderr)
 
-    if len(sys.argv) == 2:
-        proxy = {"proxy_host": sys.argv[1]}
-    elif len(sys.argv) == 3:
-        proxy = {"proxy_host": sys.argv[1], "proxy_port": sys.argv[2]}
-    else:
-        proxy = {}
+    conf_file = os.path.join(
+        xdg.BaseDirectory.save_config_path('socialsound'),
+        'config.ini')
+    config = ConfigObj(conf_file)
 
-    factory = PandoraFactory("ws://localhost:9000", debug=False, **proxy)
+    username = config['Pandora']['username']
+    password = config['Pandora']['password']
+
+    proxy = config.get('Proxy', {})
+    proxy_host = proxy.get('host', None)
+    proxy_port = proxy.get('port', None)
+    proxy = {}
+    if proxy_host: proxy['proxy_host'] = proxy_host
+    if proxy_port: proxy['proxy_port'] = proxy_port
+
+    # Start websocket listener
+    factory = PandoraFactory("ws://localhost:9000", debug=False,
+                             username=username, password=password, **proxy)
     factory.protocol = PandoraProtocol
     listenWS(factory)
+
+    # Start the MPD client factory.
+    factory.player = PlayerFactory()
+    reactor.connectTCP(MPD_HOST, MPD_PORT, factory.player)
 
     reactor.run()
 
