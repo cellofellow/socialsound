@@ -81,6 +81,12 @@ class PandoraProtocol(WebSocketServerProtocol, PandoraMixin):
             self.sendMessage("There was a server error.")
             failure.Failure().printTraceback()
 
+    @inlineCallbacks
+    def cmd_stop(self, _):
+        self.factory.station = None
+        yield self.factory.player.p.stop()
+        yield self.factory.player.p.clear()
+
 
 class PandoraFactory(WebSocketServerFactory, PandoraMixin):
     """
@@ -271,6 +277,11 @@ class PandoraFactory(WebSocketServerFactory, PandoraMixin):
             if s.id == id:
                 return s
 
+    def get_song_by_mpd_id(self, song_id):
+        for song in playlist:
+            if get(song, 'mpd_id', None) == song_id:
+                return song
+
     @inlineCallbacks
     def add_feedback(self, track_token, rating):
         log.msg("pandora: addFeedback")
@@ -304,6 +315,8 @@ class PandoraFactory(WebSocketServerFactory, PandoraMixin):
             raise SocialSoundError(
                 "Station {} not found".format(station_id))
         self.station = station
+        player.stop()
+        player.clear()
         while self.station == station:
             yield self.get_playlist()
             player.command_list_ok_begin()
@@ -313,45 +326,34 @@ class PandoraFactory(WebSocketServerFactory, PandoraMixin):
             for mpd_id, song in zip(result_list, self.playlist):
                 song.mpd_id = mpd_id
             yield player.playid(self.playlist[0].mpd_id)
-            self.status_loop()
 
-    @inlineCallbacks
-    def status_loop(self):
-        player = self.player.p
-        previous_song = None
-        current_song = None
-        status = yield player.status()
-        current_song_id = status.get('song_id', None)
-        if current_song_id is None:
-            returnValue(None)
-        current_song = [s for s in self.playlist
-                        if s.mpd_id == current_song_id][0]
+            songs = iter(self.playlist)
+            song = songs.next()
+            while self.station == station:
+                try:
+                    status = yield player.status()
+                    log.msg(status)
+                    log.msg(song)
 
-        while [s for s in self.playlist if not hasattr(s, 'played')]:
-            try:
-                log.msg("Previous Song: {}".format(unicode(previous_song)))
-                log.msg("Current Song: {}".format(unicode(current_song)))
-                status = yield player.status()
+                    current_song_id = status.get('songid', None)
+                    log.msg("Current Song MPD id: {}".format(current_song_id))
+                    if current_song_id is None:
+                        break
+                    if current_song_id != song.mpd_id:
+                        log.msg("Moving to next song...")
+                        song = songs.next()
 
-                current_song_id = status.get('song_id', None)
-                if current_song_id is None:
-                    returnValue(None)
-
-                previous_song = current_song
-                current_song = [s for s in self.playlist
-                                if s.mpd_id == current_song_id][0]
-
-                if previous_song != current_song:
-                    prevous_song.played = True
-
-                status['current_song'] = unicode(current_song)
-                message = json.dumps(status, indent=4)
-                for c in self.clients:
-                    c.sendMessage(message)
-                yield task.deferLater(reactor, 1, lambda: None)
-
-            except Exception:
-                failure.Failure().printTraceback()
+                    status['current_song'] = unicode(song)
+                    message = json.dumps(status, indent=4)
+                    log.msg(self.clients)
+                    for c in self.clients:
+                        c.sendMessage(message)
+                    yield task.deferLater(reactor, 1, lambda: None)
+                except StopIteration:
+                    log.msg("Playlist exhausted. Fetching another...")
+                    break
+                except Exception:
+                    failure.Failure().printTraceback()
 
 
 class PlayerFactory(MPDFactory):
