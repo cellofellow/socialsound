@@ -330,6 +330,7 @@ class PandoraFactory(WebSocketServerFactory, PandoraMixin):
             songs = iter(self.playlist)
             song = songs.next()
             while self.station == station:
+                player = self.player.p
                 try:
                     status = yield player.status()
                     log.msg(status)
