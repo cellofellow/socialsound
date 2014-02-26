@@ -18,3 +18,6 @@ for Pithos on Linux.
 
 Pithos is licensed GPLv3 but SocialSound is licensed AGPLv3 because it is
 probably not wise to run this as a public SaaS product.
+
+This project might be superseded by a Golang project,
+https://github.com/cellofellow/gopiano.
